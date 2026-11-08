@@ -4,19 +4,54 @@
   "description": "Shows the git branch of the active Claude Code session in the status bar, right next to the workspace branch, and warns when they differ.",
   "version": "1.0.0",
   "publisher": "SergiMoreno",
-  "author": { "name": "Sergi Moreno" },
+  "author": {
+    "name": "Sergi Moreno"
+  },
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/smoreno123/session-branch-for-claude-code.git"
+  },
+  "bugs": {
+    "url": "https://github.com/smoreno123/session-branch-for-claude-code/issues"
+  },
+  "homepage": "https://github.com/smoreno123/session-branch-for-claude-code#readme",
   "icon": "images/icon.png",
-  "galleryBanner": { "color": "#1e293b", "theme": "dark" },
-  "categories": ["Other", "SCM Providers"],
-  "keywords": ["claude", "claude code", "git", "branch", "worktree", "status bar", "ai", "session"],
-  "engines": { "vscode": "^1.90.0" },
+  "galleryBanner": {
+    "color": "#1e293b",
+    "theme": "dark"
+  },
+  "categories": [
+    "Other",
+    "SCM Providers"
+  ],
+  "keywords": [
+    "claude",
+    "claude code",
+    "git",
+    "branch",
+    "worktree",
+    "status bar",
+    "ai",
+    "session"
+  ],
+  "engines": {
+    "vscode": "^1.90.0"
+  },
   "main": "./extension.js",
-  "activationEvents": ["onStartupFinished"],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "contributes": {
     "commands": [
-      { "command": "claudeBranchStatus.info", "title": "Session Branch: Show Session Info" },
-      { "command": "claudeBranchStatus.refresh", "title": "Session Branch: Refresh" }
+      {
+        "command": "claudeBranchStatus.info",
+        "title": "Session Branch: Show Session Info"
+      },
+      {
+        "command": "claudeBranchStatus.refresh",
+        "title": "Session Branch: Refresh"
+      }
     ],
     "configuration": {
       "title": "Session Branch for Claude Code",

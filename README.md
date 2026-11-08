@@ -53,4 +53,4 @@ This is an unofficial, community extension. It is not affiliated with, endorsed 
 
 ## License
 
-MIT. See the LICENSE file included with the extension.
+[MIT](LICENSE)

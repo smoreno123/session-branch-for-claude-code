@@ -100,7 +100,7 @@ test.after(() => {
 // ======================= parseTranscript =======================
 test('parseTranscript: campos básicos', () => {
   const r = T.parseTranscript(fs.readFileSync(transcript({ title: 'A', branch: 'main', sessionId: 'p1' }), 'utf8'));
-  assert.deepEqual(r, { customTitle: null, aiTitle: 'A', branch: 'main', cwd: WS.dir, sessionId: 'p1' });
+  assert.deepEqual(r, { customTitle: null, aiTitle: 'A', branch: 'main', cwd: WS.dir, sessionId: 'p1', worktree: null, paths: [WS.dir], work: [] });
 });
 
 test('parseTranscript: se queda con la ÚLTIMA aparición (rama y título cambian)', () => {
@@ -136,7 +136,7 @@ test('parseTranscript: contenido del usuario que imita un campo no rompe nada', 
 });
 
 test('parseTranscript: vacío / basura / líneas cortadas', () => {
-  assert.deepEqual(T.parseTranscript(''), { customTitle: null, aiTitle: null, branch: null, cwd: null, sessionId: null });
+  assert.deepEqual(T.parseTranscript(''), { customTitle: null, aiTitle: null, branch: null, cwd: null, sessionId: null, worktree: null, paths: [], work: [] });
   const r = T.parseTranscript('no json\n{"aiTitle":"ok","gitBranch":"m"}\n{"aiTitle":"cort');
   assert.equal(r.aiTitle, 'ok');
   assert.equal(r.branch, 'm');
@@ -155,6 +155,25 @@ test('parseTranscript: rendimiento con transcript grande (~20 MB)', () => {
   const ms = Date.now() - t0;
   assert.equal(r.branch, 'ultima');
   assert.ok(ms < 1500, `tarda ${ms} ms`);
+});
+
+test('parseTranscript: worktree-state (entrar / salir) y relocatedCwd', () => {
+  const wt = { originalCwd: '/repo', worktreePath: '/repo/.claude/worktrees/x', worktreeName: 'x', worktreeBranch: 'worktree-x', originalBranch: 'main' };
+  const enter = [
+    { type: 'user', sessionId: 'w', cwd: '/repo', gitBranch: 'main' },
+    { type: 'relocated', sessionId: 'w', relocatedCwd: '/repo/.claude/worktrees/x' },
+    { type: 'worktree-state', worktreeSession: wt, sessionId: 'w' },
+  ];
+  const r = T.parseTranscript(enter.map((l) => JSON.stringify(l)).join('\n') + '\n');
+  assert.deepEqual(r.worktree, { path: wt.worktreePath, branch: 'worktree-x', name: 'x', originalCwd: '/repo' });
+  assert.equal(r.cwd, '/repo/.claude/worktrees/x', 'relocatedCwd posterior al último cwd manda');
+  const exit = [...enter, { type: 'worktree-state', worktreeSession: null, sessionId: 'w' }, { type: 'user', sessionId: 'w', cwd: '/repo', gitBranch: 'main' }];
+  const r2 = T.parseTranscript(exit.map((l) => JSON.stringify(l)).join('\n'));
+  assert.equal(r2.worktree, null, 'al salir del worktree se olvida');
+  assert.equal(r2.cwd, '/repo');
+  // un mensaje del usuario que menciona el registro no cuenta
+  const fake = JSON.stringify({ type: 'user', message: { content: '{"type":"worktree-state","worktreeSession":{"worktreePath":"/x"}}' } });
+  assert.equal(T.parseTranscript(fake).worktree, null);
 });
 
 // ======================= titleMatches =======================
@@ -429,4 +448,203 @@ test('deactivate / dispose: limpia el intervalo', () => {
   assert.doesNotThrow(() => ext.deactivate());
   for (const d of ctx.subscriptions) d.dispose?.();
   ctx.subscriptions.length = 0;
+});
+
+// ======================= worktrees (EnterWorktree mueve el transcript) =======================
+function enterWorktree(oldFile, { sid, wtDir, wtBranch, projDir }) {
+  // Claude Code renombra el transcript a la carpeta de proyecto del worktree y añade
+  // un registro "relocated" y otro "worktree-state"
+  const d = path.join(PROJ, projDir);
+  fs.mkdirSync(d, { recursive: true });
+  const nf = path.join(d, `${sid}.jsonl`);
+  fs.renameSync(oldFile, nf);
+  fs.appendFileSync(nf, [
+    { type: 'relocated', sessionId: sid, relocatedCwd: wtDir },
+    { type: 'worktree-state', sessionId: sid, worktreeSession: { originalCwd: WS.dir, worktreePath: wtDir, worktreeName: 'wt1', worktreeBranch: wtBranch, originalBranch: 'main' } },
+  ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+  return nf;
+}
+function addWorktree(name, branch) {
+  const dir = path.join(WS.dir, '.claude', 'worktrees', name);
+  execFileSync('git', ['-C', WS.dir, 'worktree', 'add', '-q', '-b', branch, dir], { stdio: 'pipe' });
+  return dir;
+}
+
+test('worktree: Claude entra en un worktree estando en otra pestaña → se sigue el transcript movido', async () => {
+  const wtDir = addWorktree('wt1', 'worktree-wt1');
+  const f = transcript({ title: 'entra en worktree', branch: 'main', sessionId: 'ewt' });
+  await switchTo('entra en worktree');
+  assert.equal(T.getItem().text, '$(sparkle) main');
+  setTab('archivo.js', 'default');
+  await T.refresh();
+  const nf = enterWorktree(f, { sid: 'ewt', wtDir, wtBranch: 'worktree-wt1', projDir: 'wt-proj' });
+  await T.refresh();
+  assert.equal(T.getCurrent().file, nf, 'debe encontrar el transcript movido');
+  // también ha trabajado en el checkout principal (su cwd antes de entrar) → +1
+  assert.equal(T.getItem().text, '$(sparkle) worktree-wt1 $(repo-forked) +1 $(warning)');
+  assert.match(T.getItem().tooltip.value, /Worktree: `.*wt1`/);
+  assert.match(T.getItem().tooltip.value, /_\(last active\)_/);
+});
+
+test('worktree: al volver a la pestaña de Claude muestra la rama real del worktree', async () => {
+  const wtDir = path.join(WS.dir, '.claude', 'worktrees', 'wt1');
+  // Claude cambia de rama dentro del worktree: manda lo que hay ahora en disco
+  execFileSync('git', ['-C', wtDir, 'checkout', '-q', '-b', 'otra-en-wt'], { stdio: 'pipe' });
+  const item = await switchTo('entra en worktree');
+  assert.equal(T.getCurrent().sessionId, 'ewt');
+  assert.match(item.text, /^\$\(sparkle\) otra-en-wt \$\(repo-forked\)/);
+  await commands['claudeBranchStatus.info']();
+  assert.match(messages.at(-1).msg, /branch otra-en-wt \(worktree .*wt1\)/);
+});
+
+test('worktree: al salir del worktree vuelve a la rama normal', async () => {
+  const f = (await T.sessions()).find((s) => s.sessionId === 'ewt').file;
+  fs.appendFileSync(f, [
+    { type: 'worktree-state', sessionId: 'ewt', worktreeSession: null },
+    { type: 'user', sessionId: 'ewt', cwd: WS.dir, gitBranch: 'main' },
+  ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+  const item = await switchTo('entra en worktree');
+  assert.equal(item.text, '$(sparkle) main +1', 'el worktree sigue contando como repo de la sesión');
+  assert.doesNotMatch(item.tooltip.value, /- Worktree:/);
+});
+
+test('worktree: worktree fuera de la carpeta del workspace sigue contando como "de esta carpeta"', async () => {
+  transcript({ dir: 'b', title: 'dup wt', branch: 'otro', cwd: OTHER.dir, sessionId: 'dwOther' });
+  const f = transcript({ dir: 'c', title: 'dup wt', branch: 'feature-174', cwd: WT.dir, sessionId: 'dwMine', ageDays: 1,
+    lines: [
+      { type: 'user', sessionId: 'dwMine', cwd: WT.dir, gitBranch: 'feature-174' },
+      { type: 'ai-title', aiTitle: 'dup wt', sessionId: 'dwMine' },
+      { type: 'worktree-state', sessionId: 'dwMine', worktreeSession: { originalCwd: WS.dir, worktreePath: WT.dir, worktreeBranch: 'feature-174' } },
+    ] });
+  assert.ok(f);
+  await switchTo('dup wt');
+  assert.equal(T.getCurrent().sessionId, 'dwMine');
+});
+
+test('sessions: mismo sessionId en dos carpetas → solo el más reciente', async () => {
+  transcript({ dir: 'dupA', title: 'dup sid', branch: 'viejo', sessionId: 'dsid', ageDays: 1 });
+  transcript({ dir: 'dupB', title: 'dup sid', branch: 'nuevo', sessionId: 'dsid' });
+  const found = (await T.sessions()).filter((s) => s.sessionId === 'dsid');
+  assert.equal(found.length, 1);
+  assert.equal(found[0].branch, 'nuevo');
+  assert.match(await T.findSessionFile('dsid'), /dupB/);
+  assert.equal(await T.findSessionFile('no-existe'), null);
+});
+
+// ======================= varios repos en una sesión =======================
+test('parseActivity: herramientas, cwd, cd / pushd / git -C, ~, comillas; sin duplicados y por recencia', () => {
+  const rows = [
+    { type: 'user', cwd: '/r/a' },
+    { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: '/r/b/src/x.js' } }] } },
+    { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Grep', input: { pattern: 'x', path: '/r/c' } }] } },
+    { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'cd /r/d && npm test; git -C "/r/e f" status | head; pushd ~/r/g; cd relativo; cd \'/r/h\'' } }] } },
+    { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: '/r/b/src/x.js' } }] } },
+    { type: 'user', message: { content: 'texto {"type":"tool_use","name":"Edit","input":{"file_path":"/falso"}} y "file_path":"/falso2"' } },
+  ];
+  const r = T.parseActivity(rows.map((x) => JSON.stringify(x)).join('\n'));
+  const g = path.join(os.homedir(), 'r/g');
+  assert.deepEqual(r.paths, ['/r/a', '/r/c', '/r/d', '/r/e f', g, '/r/h', '/r/b/src/x.js']);
+  // solo cuenta como trabajo editar/escribir y ejecutar comandos; leer (Read, Grep) no
+  assert.deepEqual(r.work, ['/r/d', '/r/e f', g, '/r/h', '/r/b/src/x.js']);
+});
+
+test('parseActivity: un Bash sin cd trabaja en el cwd de ese mensaje', () => {
+  const rows = [
+    { type: 'assistant', cwd: '/r/a', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'cd /r/otro && ls' } }] } },
+    { type: 'assistant', cwd: '/r/a', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'npm test' } }] } },
+  ];
+  assert.deepEqual(T.parseActivity(rows.map((x) => JSON.stringify(x)).join('\n')).work, ['/r/otro', '/r/a']);
+});
+
+test('parseActivity: se queda con las 200 más recientes', () => {
+  const rows = Array.from({ length: 300 }, (_, i) => JSON.stringify({ cwd: `/p/${i}` }));
+  const ps = T.parseActivity(rows.join('\n')).paths;
+  assert.equal(ps.length, 200);
+  assert.equal(ps[0], '/p/100');
+  assert.equal(ps.at(-1), '/p/299');
+});
+
+test('multi-repo: la sesión trabaja en otros repos (local y worktree) → +N y lista en el tooltip', async () => {
+  const API = gitRepo(path.join(TMP, 'multi', 'api'), 'develop');
+  const WEB = gitRepo(path.join(TMP, 'multi', 'web'), 'main');
+  const webWt = path.join(TMP, 'multi', 'web-wt');
+  execFileSync('git', ['-C', WEB.dir, 'worktree', 'add', '-q', '-b', 'feat-web', webWt], { stdio: 'pipe' });
+  const sid = 'multi';
+  const tool = (name, input) => ({ type: 'assistant', sessionId: sid, message: { content: [{ type: 'tool_use', name, input }] } });
+  transcript({ sessionId: sid, lines: [
+    { type: 'user', sessionId: sid, cwd: WS.dir, gitBranch: 'main' },
+    { type: 'ai-title', aiTitle: 'varios repos', sessionId: sid },
+    tool('Edit', { file_path: path.join(API.dir, 'src', 'borrado.js') }), // el fichero ya no existe
+    tool('Bash', { command: `cd ${webWt} && git status` }),
+    tool('Read', { file_path: path.join(TMP, 'no-es-repo', 'x.txt') }),
+    tool('Read', { file_path: path.join(WS.dir, 'README.md') }),
+  ] });
+  // lo último que hizo fue trabajar en el worktree de web (los Read posteriores no cuentan)
+  const item = await switchTo('varios repos');
+  assert.equal(item.text, '$(sparkle) feat-web $(repo-forked) +2 $(warning)');
+  const tip = item.tooltip.value;
+  assert.match(tip, /Repos in this session/);
+  assert.match(tip, new RegExp(`Working in: \`${webWt}\` \\(worktree\\)`));
+  assert.match(tip, /\$\(repo-forked\) \*\*web\*\* → `feat-web` \(worktree\) _\(active\)_/);
+  assert.match(tip, /\$\(repo\) \*\*repo\*\* → `main` _\(session cwd\)_/);
+  assert.match(tip, /\$\(repo\) \*\*api\*\* → `develop`/);
+  assert.doesNotMatch(tip, /no-es-repo/);
+  // orden: activo, cwd de la sesión, resto por recencia
+  assert.ok(tip.indexOf('**web**') < tip.indexOf('**repo**') && tip.indexOf('**repo**') < tip.indexOf('**api**'));
+  // las ramas son en vivo
+  API.checkout('hotfix');
+  assert.match((await switchTo('varios repos')).tooltip.value, /\*\*api\*\* → `hotfix`/);
+  await commands['claudeBranchStatus.info']();
+  assert.match(messages.at(-1).msg, /→ branch feat-web \(worktree .*web-wt\) · Repos: web \(worktree\) → feat-web, repo → main, api → hotfix/);
+});
+
+test('multi-repo: un solo repo → sin +N ni lista', async () => {
+  const item = await switchTo('misma rama');
+  assert.equal(item.text, '$(sparkle) main');
+  assert.doesNotMatch(item.tooltip.value, /Repos in this session/);
+});
+
+test('multi-repo: sesión abierta fuera de un repo que escribe en uno → muestra la rama de ese repo', async () => {
+  const API2 = gitRepo(path.join(TMP, 'multi2', 'api2'), 'release');
+  const sid = 'fuera';
+  transcript({ dir: 'fuera', sessionId: sid, lines: [
+    { type: 'user', sessionId: sid, cwd: path.join(TMP, 'multi2'), gitBranch: '' },
+    { type: 'ai-title', aiTitle: 'desde fuera', sessionId: sid },
+    { type: 'assistant', sessionId: sid, message: { content: [{ type: 'tool_use', name: 'Write', input: { file_path: path.join(API2.dir, 'a.txt') } }] } },
+  ] });
+  const item = await switchTo('desde fuera');
+  assert.equal(item.text, '$(sparkle) release $(warning)', 'el repo donde escribe pasa a ser el principal');
+  assert.match(item.tooltip.value, new RegExp(`Working in: \`${API2.dir}\``));
+  assert.doesNotMatch(item.tooltip.value, /Repos in this session/, 'un solo repo: sin lista');
+});
+
+test('multi-repo: Claude trabaja con "cd worktree && …" mientras el cwd está en otra rama (caso real)', async () => {
+  // el checkout principal está en 173, la sesión lo registra como gitBranch, pero Claude
+  // trabaja en el worktree de la 160 haciendo cd en cada comando (el shell vuelve al cwd)
+  const MAIN = gitRepo(path.join(TMP, 'real', 'botcontroller'), '173_last_visit');
+  const wt160 = path.join(TMP, 'real', 'botcontroller-160');
+  execFileSync('git', ['-C', MAIN.dir, 'worktree', 'add', '-q', '-b', '160_mejora_entrega_huecos', wt160], { stdio: 'pipe' });
+  const sid = 'real160';
+  const bash = (command) => ({ type: 'assistant', sessionId: sid, cwd: MAIN.dir, gitBranch: '173_last_visit', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command } }] } });
+  const lines = [
+    { type: 'user', sessionId: sid, cwd: MAIN.dir, gitBranch: '173_last_visit' },
+    { type: 'custom-title', customTitle: '160_mejora_entrega_huecos', sessionId: sid },
+    bash(`cd ${wt160}; grep -rn shiftedDays src | head`),
+    { type: 'assistant', sessionId: sid, cwd: MAIN.dir, message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: path.join(MAIN.dir, 'README.md') } }] } },
+    bash(`cd ${wt160}; sed -n 1,10p test/e2e/ESTADO.md`),
+    { type: 'user', sessionId: sid, cwd: MAIN.dir, gitBranch: '173_last_visit' },
+  ];
+  const f = transcript({ dir: 'real', sessionId: sid, lines });
+  const bak = vscode.workspace.workspaceFolders;
+  vscode.workspace.workspaceFolders = [{ uri: { fsPath: MAIN.dir } }];
+  try {
+    let item = await switchTo('160_mejora_entrega_huecos');
+    assert.equal(item.text, '$(sparkle) 160_mejora_entrega_huecos $(repo-forked) +1 $(warning)');
+    assert.match(item.tooltip.value, /Session cwd: `.*botcontroller` \(now on `173_last_visit`\)/);
+    // si después vuelve a trabajar en el checkout principal, se muestra ese
+    fs.appendFileSync(f, JSON.stringify(bash('npm test')) + '\n');
+    item = await switchTo('160_mejora_entrega_huecos');
+    assert.equal(item.text, '$(sparkle) 173_last_visit +1');
+    assert.doesNotMatch(item.tooltip.value, /Working in/);
+  } finally { vscode.workspace.workspaceFolders = bak; }
 });

@@ -2,7 +2,7 @@
   "name": "session-branch-for-claude-code",
   "displayName": "Session Branch for Claude Code",
   "description": "Shows the git branch of the active Claude Code session in the status bar, right next to the workspace branch, and warns when they differ.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "publisher": "SergiMoreno",
   "author": {
     "name": "Sergi Moreno"
